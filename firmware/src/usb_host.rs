@@ -278,6 +278,10 @@ struct HostInner {
     /// Every channel ever created, by interface number. Channels are never
     /// dropped: the CDC callbacks hold raw pointers into them.
     channels: Mutex<BTreeMap<u8, UsbSerial>>,
+    /// Held while an interface is being opened: a client's thread and the
+    /// manager can both want the same interface open, and the second must
+    /// see what the first did.
+    opening: Mutex<()>,
     /// Interfaces whose port would pass 65535, warned about once.
     refused: Mutex<Vec<u8>>,
     on_channel: ChannelHook,
@@ -468,6 +472,7 @@ impl UsbHost {
             present: Mutex::new(Vec::new()),
             wake: Condvar::new(),
             channels: Mutex::new(BTreeMap::new()),
+            opening: Mutex::new(()),
             refused: Mutex::new(Vec::new()),
             on_channel,
         });
@@ -637,10 +642,11 @@ fn manage(host: &Arc<HostInner>) {
                     continue;
                 }
                 match channel.try_open(driver) {
-                    Ok(()) => info!(
+                    Ok(true) => info!(
                         "usb: interface {interface} open on port {} for the waiting client",
                         inner.port
                     ),
+                    Ok(false) => {}
                     Err(e) => {
                         warn!("usb: interface {interface}: {e}; the client on port {} waits for the next device", inner.port);
                         inner.open_failed.store(true, Ordering::Relaxed);
@@ -688,6 +694,7 @@ impl UsbSerial {
         }
         let driver = *host.driver.lock().unwrap();
         self.try_open(driver)
+            .map(|_| ())
             .map_err(|e| OpenError::Failed(e.to_string()))
     }
 
@@ -696,8 +703,11 @@ impl UsbSerial {
     /// toggle of each endpoint from the session before, so claiming the
     /// interface per session made the device acknowledge and drop the first
     /// packet of every other session (the host cannot tell; the first
-    /// keystroke just vanished). The claim is given up by `unclaim`, when
-    /// another channel needs the pipes, or when the device leaves.
+    /// keystroke just vanished). The claim ends when the device leaves:
+    /// closing an interface of a device that keeps talking (an FTDI chip
+    /// answers every IN poll) races with the CDC driver's task inside the
+    /// driver and the host controller code and crashed the firmware about
+    /// one time in ten, so it is not done while the device is attached.
     pub fn close(&self) {
         self.inner.wanted.store(false, Ordering::SeqCst);
         self.inner.open_failed.store(false, Ordering::Relaxed);
@@ -705,55 +715,16 @@ impl UsbSerial {
         debug!("usb: interface {} idle", self.inner.interface);
     }
 
-    /// Releases the interface, so its pipes are free for another channel.
-    fn unclaim(&self) {
-        self.inner.attached.store(false, Ordering::SeqCst);
-        let mut d = self.inner.dev.lock().unwrap();
-        if let Some(h) = d.handle.take() {
-            if d.in_use {
-                // A transfer is in flight: its thread closes the handle.
-                d.pending_close = Some(h);
-            } else {
-                drop(d);
-                unsafe { usb::cdc_acm_host_close(h.0) };
-            }
-        }
-        self.inner.rx.lock().unwrap().clear();
-        debug!("usb: interface {} released", self.inner.interface);
-    }
-
-    /// Releases an idle interface (claimed, no client) for one that a client
-    /// is waiting for, when the host controller has no pipes left. `true`
-    /// when one was released and opening can be tried again.
-    fn unclaim_idle_sibling(&self) -> bool {
+    /// Claims and configures the interface. `Ok(false)` when another thread
+    /// had done it in the meantime.
+    fn try_open(&self, driver: Driver) -> Result<bool> {
         let Some(host) = self.inner.host.upgrade() else {
-            return false;
+            return Err(anyhow!("usb host gone"));
         };
-        let idle = host
-            .channels
-            .lock()
-            .unwrap()
-            .values()
-            .find(|c| {
-                c.inner.interface != self.inner.interface
-                    && c.inner.attached.load(Ordering::SeqCst)
-                    && !c.inner.wanted.load(Ordering::SeqCst)
-            })
-            .cloned();
-        match idle {
-            Some(c) => {
-                info!(
-                    "usb: interface {} released for interface {}",
-                    c.inner.interface, self.inner.interface
-                );
-                c.unclaim();
-                true
-            }
-            None => false,
+        let _one_at_a_time = host.opening.lock().unwrap();
+        if self.inner.attached.load(Ordering::SeqCst) {
+            return Ok(false);
         }
-    }
-
-    fn try_open(&self, driver: Driver) -> Result<()> {
         unsafe {
             let mut cfg: usb::cdc_acm_host_open_config_t = core::mem::zeroed();
             cfg.vid = usb::CDC_HOST_ANY_VID as u16;
@@ -768,13 +739,10 @@ impl UsbSerial {
             // The callbacks get the channel back through this.
             cfg.user_arg = Arc::as_ptr(&self.inner) as *mut c_void;
             let mut hdl: usb::cdc_acm_dev_hdl_t = core::ptr::null_mut();
-            let mut rc = usb::cdc_acm_host_open_v2(&cfg, &mut hdl);
-            if rc == sys::ESP_ERR_NOT_SUPPORTED && self.unclaim_idle_sibling() {
-                rc = usb::cdc_acm_host_open_v2(&cfg, &mut hdl);
-            }
+            let rc = usb::cdc_acm_host_open_v2(&cfg, &mut hdl);
             if rc == sys::ESP_ERR_NOT_SUPPORTED {
                 return Err(anyhow!(
-                    "no free USB host pipe (the ESP32-S3 has 8: one for control and two per open interface)"
+                    "no free USB host pipe (the ESP32-S3 has 8: one for control and two per claimed interface); ports stay claimed until the device is replugged"
                 ));
             }
             if rc != sys::ESP_OK {
@@ -817,7 +785,7 @@ impl UsbSerial {
         }
         // A setting that changed while we were configuring.
         self.flush();
-        Ok(())
+        Ok(true)
     }
 
     /// The line settings of the current session.

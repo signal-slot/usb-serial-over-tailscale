@@ -20,6 +20,8 @@ Verified on hardware:
 - Wi-Fi setup through the wizard and joining a tailnet with the approval URL.
 - `tailscale ping` from another node, both via DERP and over a direct path.
 - Console access to a Raspberry Pi Debug Probe (CDC-ACM) and a Toradex Dahlia (FT4232H).
+- RFC 2217 sessions against both: baud rate and framing changes, DTR and RTS, break and purge from pyserial.
+- On the FT4232H, three ports claimed at once and a client on the fourth port refused.
 - Recovery after adapter reboot, Wi-Fi reconnection and USB replug.
 
 Not verified:
@@ -28,7 +30,7 @@ Not verified:
 - CP210x, CH340/CH341, and non-H-series FTDI chips such as the FT232R.
 - Recovery after a reboot of the target SBC, an internet outage, or an unreachable control server.
 - Long-running operation, behaviour after node key expiry (180 days by default), and reboots triggered by the task watchdog.
-- RFC 2217 sessions on the hardware (pyserial and esptool against the Telnet state machine are tested on the host with `cargo run -p adapter-core --example rfc2217_sim`).
+- esptool through RFC 2217 (its DTR and RTS sequence is tested on the host with `cargo run -p adapter-core --example rfc2217_sim`).
 
 ### Module variants
 
@@ -188,7 +190,7 @@ Bytes the target sends before the client's first byte go out unframed in either 
 The ports are independent: each has its own USB interface, its own busy state and its own line settings, and a client on one port does not block another.
 They share one USB device and one tailnet address.
 The USB interface is claimed when the first client connects to its port and stays claimed after the client leaves; output from the target is dropped while nobody is connected.
-The ESP32-S3's host controller has eight pipes, one for control and two per open interface (three for CDC-ACM), so at most three ports of an FT4232H can be claimed at the same time. A client on a fourth port takes the pipes of an idle port; if every claimed port has a client, the connection is told `usb: cannot open the interface` and closed.
+The ESP32-S3's host controller has eight pipes, one for control and two per claimed interface (three for CDC-ACM), so at most three ports of an FT4232H can be claimed, and the claims last until the device is unplugged or the adapter reboots. A client on a fourth port is told `usb: cannot open the interface: no free USB host pipe` and closed.
 `status` on the shell lists the interfaces with their ports, marks the open ones with their line settings and the idle claimed ones with `claimed`.
 
 ### Power and wiring
@@ -254,6 +256,8 @@ The cargo runner pins the board's UART port to `/dev/ttyACM0`; adjust `.cargo/co
 - Network thread stacks live in PSRAM; only the control thread, which writes flash, keeps an internal-RAM stack.
 - The USB host relies on the CDC-ACM host driver's fallback of opening any interface with two bulk endpoints; FTDI, CP210x and CH34x get only their chip-specific setup through vendor control transfers.
 - The interface stays claimed between sessions because of the USB data toggle. A pipe the host creates starts at DATA0, while the device keeps the toggle of each endpoint from the session before. Claiming the interface per session made the device acknowledge and drop the first packet of every other session, with no error on the host: the first keystroke vanished. Asking the device to reset its toggles with CLEAR_FEATURE(ENDPOINT_HALT) was tried and does not work on the Debug Probe (TinyUSB), so the pipes are kept instead.
+- A claim is not released while the device is attached, so a fourth port cannot take the pipes of an idle one. Closing an interface of a device that keeps answering IN polls (an FTDI chip does, every 2 ms) races with the CDC driver's task: the driver halts and clears the pipe and releases the interface while its task resubmits the poll, and the release or the host controller's interrupt handler aborts the firmware about one close in ten. Retrying the release and halting the pipes again from the closing thread (through a linker `--wrap`) and ESP-IDF v5.3.5 (espressif/esp-idf#17707) were tried and still crashed.
+- A break on a Linux console, or bytes sent at a lower baud rate than the console's, is a BREAK to the target: `agetty` then cycles through its baud rates, and the kernel's SysRq takes the next byte as a command, which can reboot the target. Test line settings against a console that has nothing to lose.
 
 ## Out of scope
 

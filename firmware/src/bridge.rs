@@ -10,9 +10,9 @@
 //! One bridge serves one channel. A device with several serial interfaces (an
 //! FT4232H has four) has one bridge per interface, each on its own port, and
 //! "busy" is per bridge: a client on one port does not block the other. The
-//! USB interface is claimed at the first session and kept, so that the
-//! device's data toggles stay in step with the host's pipes; it is released
-//! when another port needs the pipes (see `usb_host`).
+//! USB interface is claimed at the first session and kept until the device
+//! leaves, so that the device's data toggles stay in step with the host's
+//! pipes (see `usb_host`).
 
 use crate::usb_host::{OpenError, UsbSerial};
 use adapter_core::rfc2217::{Command, Purge, Session};
