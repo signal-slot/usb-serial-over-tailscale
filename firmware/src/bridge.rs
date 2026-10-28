@@ -1,5 +1,8 @@
-//! Transparent bridge between one TCP client on the tailnet and the USB serial
-//! console. Bytes are forwarded unchanged in both directions.
+//! Bridge between one TCP client on the tailnet and the USB serial
+//! console. Bytes are forwarded unchanged in both directions, unless the
+//! client opens with Telnet negotiation: then the session speaks RFC 2217
+//! and the client can set the baud rate, the framing and the DTR and RTS
+//! lines (see `adapter_core::rfc2217`).
 //!
 //! Accepting runs on its own thread so that a second client is told the
 //! bridge is busy right away instead of waiting in the backlog.
@@ -7,15 +10,17 @@
 //! One bridge serves one channel. A device with several serial interfaces (an
 //! FT4232H has four) has one bridge per interface, each on its own port, and
 //! "busy" is per bridge: a client on one port does not block the other. The
-//! USB interface is claimed for the length of a session, so the host
-//! controller's pipes are shared by the ports that are in use.
+//! USB interface is claimed at the first session and kept, so that the
+//! device's data toggles stay in step with the host's pipes; it is released
+//! when another port needs the pipes (see `usb_host`).
 
 use crate::usb_host::{OpenError, UsbSerial};
+use adapter_core::rfc2217::{Command, Purge, Session};
 use anyhow::{anyhow, Result};
 use log::{info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tsnode::netstack::TcpStream;
 use tsnode::node::Node;
@@ -69,8 +74,15 @@ fn serve(serial: &UsbSerial, conn: TcpStream, port: u16) -> Result<()> {
         }
     }
     let conn = Arc::new(conn);
+    // The session is decided by the client's first byte; until then bytes
+    // from the target go out as they are (console output has no IAC).
+    let session = Arc::new(Mutex::new(Session::new(
+        serial.line(),
+        &format!("usb-serial-over-tailscale {}", crate::FIRMWARE_VERSION),
+    )));
     let serial2 = serial.clone();
     let c2 = conn.clone();
+    let session2 = session.clone();
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
     // Serial -> TCP
@@ -82,10 +94,15 @@ fn serve(serial: &UsbSerial, conn: TcpStream, port: u16) -> Result<()> {
         true,
         Box::new(move || {
             let mut buf = [0u8; 512];
+            let mut out = Vec::with_capacity(2 * buf.len());
             while !stop2.load(Ordering::Relaxed) {
                 let n = serial2.read(&mut buf, Duration::from_millis(100));
-                if n > 0 && c2.write_all(&buf[..n]).is_err() {
-                    break;
+                if n > 0 {
+                    out.clear();
+                    session2.lock().unwrap().encode(&buf[..n], &mut out);
+                    if c2.write_all(&out).is_err() {
+                        break;
+                    }
                 }
                 if c2.is_closed() {
                     break;
@@ -96,12 +113,40 @@ fn serve(serial: &UsbSerial, conn: TcpStream, port: u16) -> Result<()> {
     )?;
     // TCP -> Serial
     let mut buf = [0u8; 512];
+    let mut to_serial = Vec::with_capacity(buf.len());
+    let mut to_client = Vec::with_capacity(64);
+    let mut commands = Vec::new();
     let mut dropped_warned = false;
     loop {
         match conn.read(&mut buf, Duration::from_millis(100)) {
             Ok(0) => break,
             Ok(n) => {
-                if let Err(e) = serial.write(&buf[..n]) {
+                to_serial.clear();
+                to_client.clear();
+                commands.clear();
+                let telnet_before;
+                {
+                    let mut s = session.lock().unwrap();
+                    telnet_before = s.is_telnet();
+                    s.feed(&buf[..n], &mut to_serial, &mut to_client, &mut commands);
+                    if !telnet_before && s.is_telnet() {
+                        info!("bridge: {peer} on {port} speaks Telnet (RFC 2217)");
+                    }
+                }
+                for &command in &commands {
+                    let applied = apply(serial, command, peer, port);
+                    session
+                        .lock()
+                        .unwrap()
+                        .complete(command, applied, &mut to_client);
+                }
+                if !to_client.is_empty() && conn.write_all(&to_client).is_err() {
+                    break;
+                }
+                if to_serial.is_empty() {
+                    continue;
+                }
+                if let Err(e) = serial.write(&to_serial) {
                     if !dropped_warned {
                         warn!("bridge: dropping input, {e}");
                         dropped_warned = true;
@@ -122,4 +167,58 @@ fn serve(serial: &UsbSerial, conn: TcpStream, port: u16) -> Result<()> {
     serial.close();
     info!("bridge: client {peer} on {port} disconnected");
     Ok(())
+}
+
+/// Applies one RFC 2217 request to the serial port; `false` when the port
+/// refused it, which the client is then told.
+fn apply(serial: &UsbSerial, command: Command, peer: std::net::SocketAddr, port: u16) -> bool {
+    let result = match command {
+        Command::Baud(baud) => {
+            let mut line = serial.line();
+            line.baud = baud;
+            serial.set_line(line)
+        }
+        Command::DataBits(bits) => {
+            let mut line = serial.line();
+            line.data_bits = bits;
+            serial.set_line(line)
+        }
+        Command::Parity(parity) => {
+            let mut line = serial.line();
+            line.parity = parity;
+            serial.set_line(line)
+        }
+        Command::StopBits(stop_bits) => {
+            let mut line = serial.line();
+            line.stop_bits = stop_bits;
+            serial.set_line(line)
+        }
+        Command::Dtr(on) => {
+            let (_, rts) = serial.modem();
+            serial.set_modem(on, rts)
+        }
+        Command::Rts(on) => {
+            let (dtr, _) = serial.modem();
+            serial.set_modem(dtr, on)
+        }
+        Command::Break(on) => serial.set_break(on),
+        Command::Purge(purge) => {
+            // Writes are not buffered here, so only the receive side has
+            // anything to drop.
+            if purge != Purge::Transmit {
+                serial.purge_rx();
+            }
+            Ok(())
+        }
+    };
+    match result {
+        Ok(()) => {
+            info!("bridge: {peer} on {port}: {command:?}");
+            true
+        }
+        Err(e) => {
+            warn!("bridge: {peer} on {port}: {command:?} refused: {e}");
+            false
+        }
+    }
 }

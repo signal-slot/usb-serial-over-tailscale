@@ -16,9 +16,18 @@
 //! notification pipe), so an FT4232H can have three of its four ports open
 //! at once but not all four. A channel outlives the device: a session waits
 //! while nothing is plugged in and carries on when the device comes back.
+//!
+//! The line settings (baud rate and framing) and the modem lines (DTR, RTS,
+//! break) belong to the session: they start at the configured defaults when
+//! a client connects, and an RFC 2217 client can change them. The stored
+//! values are the source of truth; they are applied when the interface is
+//! opened and whenever they change while it is open.
 
 use adapter_core::usbdesc::serial_interfaces;
-use adapter_core::usbserial::{ch34x_baud_registers, ftdi_baud_request, FtdiChip};
+use adapter_core::usbserial::{
+    ch34x_baud_registers, ch34x_lcr, cp210x_line_ctl, ftdi_baud_request, ftdi_data_value, FtdiChip,
+    LineSettings, StopBits,
+};
 use anyhow::{anyhow, Result};
 use esp_idf_svc::sys::{self, usb};
 use log::{debug, info, warn};
@@ -108,6 +117,13 @@ impl Driver {
     }
 }
 
+/// CDC class requests (bmRequestType 0x21: host-to-device, class, interface)
+/// the CDC host driver has no stateful call for.
+const CDC_REQ_TYPE_OUT: u8 = 0x21;
+const CDC_SEND_BREAK: u8 = 0x23;
+/// wValue of SEND_BREAK: hold the break until a SEND_BREAK with 0.
+const CDC_BREAK_HOLD: u16 = 0xffff;
+
 /// FTDI vendor requests (bmRequestType 0x40, host-to-device, vendor, device).
 const FTDI_REQ_TYPE_OUT: u8 = 0x40;
 const FTDI_SIO_RESET: u8 = 0x00;
@@ -124,6 +140,7 @@ const FTDI_LATENCY_MS: u16 = 2;
 const CP210X_REQ_TYPE_OUT: u8 = 0x41;
 const CP210X_IFC_ENABLE: u8 = 0x00;
 const CP210X_SET_LINE_CTL: u8 = 0x03;
+const CP210X_SET_BREAK: u8 = 0x05;
 const CP210X_SET_MHS: u8 = 0x07;
 const CP210X_SET_BAUDRATE: u8 = 0x1e;
 
@@ -138,10 +155,9 @@ const CH34X_REG_PRESCALER: u16 = 0x12;
 const CH34X_REG_DIVISOR: u16 = 0x13;
 const CH34X_REG_LCR: u16 = 0x18;
 const CH34X_REG_LCR2: u16 = 0x25;
-/// 8 data bits, no parity, 1 stop bit, receiver and transmitter enabled.
-const CH34X_LCR_8N1: u16 = 0x80 | 0x40 | 0x03;
-/// DTR and RTS asserted (the chip wants the complement on the wire).
-const CH34X_MCR_DTR_RTS: u16 = (1 << 6) | (1 << 5);
+/// Modem-control bits (the chip wants the complement on the wire).
+const CH34X_MCR_DTR: u16 = 1 << 5;
+const CH34X_MCR_RTS: u16 = 1 << 6;
 
 /// How long an open waits for the device the descriptor callback just
 /// reported; it is already enumerated, so this only covers a race with
@@ -161,6 +177,23 @@ struct DevState {
     pending_close: Option<DevHandle>,
 }
 
+/// The modem lines a session drives.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Modem {
+    dtr: bool,
+    rts: bool,
+    brk: bool,
+}
+
+impl Modem {
+    /// How a session starts: both lines asserted, as a terminal leaves them.
+    const ASSERTED: Modem = Modem {
+        dtr: true,
+        rts: true,
+        brk: false,
+    };
+}
+
 /// One serial channel: an interface of the attached device.
 struct Inner {
     host: Weak<HostInner>,
@@ -175,7 +208,15 @@ struct Inner {
     /// The manager's last open failed; cleared when a device arrives or the
     /// client leaves, so a failure is logged once rather than every second.
     open_failed: AtomicBool,
-    baud: u32,
+    /// Line settings and modem lines of the current session, applied to
+    /// the interface by whoever holds its handle (see `flush`).
+    line: Mutex<LineSettings>,
+    modem: Mutex<Modem>,
+    /// What the interface was last set to, so that only changes are sent;
+    /// `None` after an open.
+    applied: Mutex<Option<(LineSettings, Modem)>>,
+    /// `line` or `modem` changed and the interface has not been told yet.
+    dirty: AtomicBool,
     interface: u8,
     /// The TCP port this channel is bridged on (first port + interface).
     port: u16,
@@ -263,6 +304,12 @@ unsafe fn inner_of<'a>(user: *mut c_void) -> Option<&'a Inner> {
 
 unsafe extern "C" fn data_cb(data: *const u8, len: usize, user: *mut c_void) -> bool {
     if let Some(inner) = inner_of(user) {
+        if !inner.wanted.load(Ordering::Relaxed) {
+            // The interface is claimed but no client is on its port: the
+            // target's output goes nowhere, as it did before the port was
+            // claimed at all.
+            return true;
+        }
         let raw = std::slice::from_raw_parts(data, len);
         // FTDI prefixes every IN packet with two status bytes (modem, line).
         let stripped: Vec<u8>;
@@ -488,10 +535,12 @@ impl UsbHost {
                     "if{}:{}{}",
                     c.inner.interface,
                     c.inner.port,
-                    if c.inner.attached.load(Ordering::Relaxed) {
-                        " (open)"
+                    if !c.inner.attached.load(Ordering::Relaxed) {
+                        String::new()
+                    } else if c.inner.wanted.load(Ordering::Relaxed) {
+                        format!(" (open, {})", c.inner.line.lock().unwrap())
                     } else {
-                        ""
+                        " (claimed)".to_string()
                     }
                 )
             })
@@ -542,7 +591,10 @@ impl HostInner {
                 attached: AtomicBool::new(false),
                 wanted: AtomicBool::new(false),
                 open_failed: AtomicBool::new(false),
-                baud: self.baud,
+                line: Mutex::new(LineSettings::new(self.baud)),
+                modem: Mutex::new(Modem::ASSERTED),
+                applied: Mutex::new(None),
+                dirty: AtomicBool::new(false),
                 interface,
                 port,
                 driver: Mutex::new(Driver::Cdc),
@@ -607,14 +659,23 @@ fn manage(host: &Arc<HostInner>) {
 
 impl UsbSerial {
     /// Claims and configures the interface for a client that just connected
-    /// to this channel's port. With nothing attached the call returns
-    /// [`OpenError::NoDevice`] and the manager opens the interface when a
-    /// device arrives; the caller keeps the session either way. Any other
-    /// error is for the caller to report and end the session with.
+    /// to this channel's port, starting the session at the configured line
+    /// settings with DTR and RTS asserted. With nothing attached the call
+    /// returns [`OpenError::NoDevice`] and the manager opens the interface
+    /// when a device arrives; the caller keeps the session either way. Any
+    /// other error is for the caller to report and end the session with.
     pub fn open(&self) -> std::result::Result<(), OpenError> {
+        if let Some(host) = self.inner.host.upgrade() {
+            *self.inner.line.lock().unwrap() = LineSettings::new(host.baud);
+        }
+        *self.inner.modem.lock().unwrap() = Modem::ASSERTED;
         self.inner.wanted.store(true, Ordering::SeqCst);
         self.inner.open_failed.store(false, Ordering::Relaxed);
         if self.inner.attached.load(Ordering::SeqCst) {
+            // Claimed since an earlier session: drop what the target said
+            // meanwhile and put the defaults on the wire.
+            self.inner.rx.lock().unwrap().clear();
+            self.sync();
             return Ok(());
         }
         let Some(host) = self.inner.host.upgrade() else {
@@ -630,11 +691,22 @@ impl UsbSerial {
             .map_err(|e| OpenError::Failed(e.to_string()))
     }
 
-    /// Releases the interface when the client leaves, so its pipes are
-    /// free for another channel.
+    /// Ends the session. The interface stays claimed: a pipe the host
+    /// creates starts at data toggle DATA0, while the device keeps the
+    /// toggle of each endpoint from the session before, so claiming the
+    /// interface per session made the device acknowledge and drop the first
+    /// packet of every other session (the host cannot tell; the first
+    /// keystroke just vanished). The claim is given up by `unclaim`, when
+    /// another channel needs the pipes, or when the device leaves.
     pub fn close(&self) {
         self.inner.wanted.store(false, Ordering::SeqCst);
         self.inner.open_failed.store(false, Ordering::Relaxed);
+        self.inner.rx.lock().unwrap().clear();
+        debug!("usb: interface {} idle", self.inner.interface);
+    }
+
+    /// Releases the interface, so its pipes are free for another channel.
+    fn unclaim(&self) {
         self.inner.attached.store(false, Ordering::SeqCst);
         let mut d = self.inner.dev.lock().unwrap();
         if let Some(h) = d.handle.take() {
@@ -647,7 +719,38 @@ impl UsbSerial {
             }
         }
         self.inner.rx.lock().unwrap().clear();
-        debug!("usb: interface {} closed", self.inner.interface);
+        debug!("usb: interface {} released", self.inner.interface);
+    }
+
+    /// Releases an idle interface (claimed, no client) for one that a client
+    /// is waiting for, when the host controller has no pipes left. `true`
+    /// when one was released and opening can be tried again.
+    fn unclaim_idle_sibling(&self) -> bool {
+        let Some(host) = self.inner.host.upgrade() else {
+            return false;
+        };
+        let idle = host
+            .channels
+            .lock()
+            .unwrap()
+            .values()
+            .find(|c| {
+                c.inner.interface != self.inner.interface
+                    && c.inner.attached.load(Ordering::SeqCst)
+                    && !c.inner.wanted.load(Ordering::SeqCst)
+            })
+            .cloned();
+        match idle {
+            Some(c) => {
+                info!(
+                    "usb: interface {} released for interface {}",
+                    c.inner.interface, self.inner.interface
+                );
+                c.unclaim();
+                true
+            }
+            None => false,
+        }
     }
 
     fn try_open(&self, driver: Driver) -> Result<()> {
@@ -665,7 +768,10 @@ impl UsbSerial {
             // The callbacks get the channel back through this.
             cfg.user_arg = Arc::as_ptr(&self.inner) as *mut c_void;
             let mut hdl: usb::cdc_acm_dev_hdl_t = core::ptr::null_mut();
-            let rc = usb::cdc_acm_host_open_v2(&cfg, &mut hdl);
+            let mut rc = usb::cdc_acm_host_open_v2(&cfg, &mut hdl);
+            if rc == sys::ESP_ERR_NOT_SUPPORTED && self.unclaim_idle_sibling() {
+                rc = usb::cdc_acm_host_open_v2(&cfg, &mut hdl);
+            }
             if rc == sys::ESP_ERR_NOT_SUPPORTED {
                 return Err(anyhow!(
                     "no free USB host pipe (the ESP32-S3 has 8: one for control and two per open interface)"
@@ -686,7 +792,10 @@ impl UsbSerial {
                 d.in_use = true;
             }
             *self.inner.driver.lock().unwrap() = driver;
-            let configured = self.configure(hdl, driver);
+            *self.inner.applied.lock().unwrap() = None;
+            let configured = self
+                .configure(hdl, driver)
+                .and_then(|()| self.apply(hdl, driver));
             let mut d = self.inner.dev.lock().unwrap();
             d.in_use = false;
             if let Some(h) = d.pending_close.take() {
@@ -706,42 +815,264 @@ impl UsbSerial {
             self.inner.rx.lock().unwrap().clear();
             self.inner.attached.store(true, Ordering::SeqCst);
         }
+        // A setting that changed while we were configuring.
+        self.flush();
         Ok(())
     }
 
-    fn configure(&self, hdl: usb::cdc_acm_dev_hdl_t, driver: Driver) -> Result<()> {
-        unsafe {
-            match driver {
-                Driver::Cdc => {
-                    let coding = usb::cdc_acm_line_coding_t {
-                        dwDTERate: self.inner.baud,
-                        bCharFormat: 0,
-                        bParityType: 0,
-                        bDataBits: 8,
-                    };
-                    if usb::cdc_acm_host_line_coding_set(hdl, &coding) != sys::ESP_OK {
-                        debug!("usb: device ignores line coding (fine for native CDC consoles)");
-                    }
-                    let _ = usb::cdc_acm_host_set_control_line_state(hdl, true, true);
+    /// The line settings of the current session.
+    pub fn line(&self) -> LineSettings {
+        *self.inner.line.lock().unwrap()
+    }
+
+    /// DTR and RTS of the current session.
+    pub fn modem(&self) -> (bool, bool) {
+        let m = *self.inner.modem.lock().unwrap();
+        (m.dtr, m.rts)
+    }
+
+    /// Sets the baud rate and framing for the rest of the session. Takes
+    /// effect at once on an open interface, or when it opens. The error
+    /// is for a setting the attached chip cannot do.
+    pub fn set_line(&self, line: LineSettings) -> Result<()> {
+        if self.driver() == Driver::Ch34x && line.stop_bits == StopBits::OneAndHalf {
+            return Err(anyhow!("CH34x has no 1.5 stop bits"));
+        }
+        if !(5..=8).contains(&line.data_bits) || line.baud == 0 {
+            return Err(anyhow!("{line} is not a serial line setting"));
+        }
+        *self.inner.line.lock().unwrap() = line;
+        self.sync();
+        Ok(())
+    }
+
+    /// Drives DTR and RTS for the rest of the session.
+    pub fn set_modem(&self, dtr: bool, rts: bool) -> Result<()> {
+        let mut m = self.inner.modem.lock().unwrap();
+        m.dtr = dtr;
+        m.rts = rts;
+        drop(m);
+        self.sync();
+        Ok(())
+    }
+
+    /// Starts or ends a break condition on the line. A device that refuses
+    /// the request (a native CDC console may) is logged, not reported.
+    pub fn set_break(&self, on: bool) -> Result<()> {
+        if self.driver() == Driver::Ch34x {
+            return Err(anyhow!("break is not implemented for CH34x"));
+        }
+        self.inner.modem.lock().unwrap().brk = on;
+        self.sync();
+        Ok(())
+    }
+
+    /// Drops what the target sent and nobody has read yet.
+    pub fn purge_rx(&self) {
+        self.inner.rx.lock().unwrap().clear();
+    }
+
+    /// The driver the session's settings are checked against: the open
+    /// interface's, or the attached device's while waiting to open.
+    fn driver(&self) -> Driver {
+        if self.inner.attached.load(Ordering::SeqCst) {
+            return *self.inner.driver.lock().unwrap();
+        }
+        match self.inner.host.upgrade() {
+            Some(host) => *host.driver.lock().unwrap(),
+            None => Driver::Cdc,
+        }
+    }
+
+    /// Marks the stored settings as changed and applies them unless another
+    /// thread holds the handle, which then applies them when it is done.
+    fn sync(&self) {
+        self.inner.dirty.store(true, Ordering::SeqCst);
+        self.flush();
+    }
+
+    /// Applies the stored settings to the open interface if they changed
+    /// and the handle is free. Called by every thread that releases the
+    /// handle, so a change made while it was busy is not lost.
+    fn flush(&self) {
+        while self.inner.dirty.load(Ordering::SeqCst) {
+            let hdl = {
+                let mut d = self.inner.dev.lock().unwrap();
+                if d.in_use || !self.inner.attached.load(Ordering::SeqCst) {
+                    // Applied by the holder, or at the next open.
+                    return;
                 }
-                Driver::Ftdi { chip, .. } => self.configure_ftdi(hdl, chip)?,
-                Driver::Cp210x => self.configure_cp210x(hdl)?,
-                Driver::Ch34x => self.configure_ch34x(hdl)?,
+                match d.handle.as_ref().map(|h| h.0) {
+                    Some(h) => {
+                        d.in_use = true;
+                        h
+                    }
+                    None => return,
+                }
+            };
+            self.inner.dirty.store(false, Ordering::SeqCst);
+            let driver = *self.inner.driver.lock().unwrap();
+            if let Err(e) = self.apply(hdl, driver) {
+                warn!("usb: interface {}: {e}", self.inner.interface);
             }
+            if self.release().is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Gives the handle back after a transfer; closes it if the device
+    /// left meanwhile, which is the error.
+    fn release(&self) -> Result<()> {
+        let mut d = self.inner.dev.lock().unwrap();
+        d.in_use = false;
+        if let Some(h) = d.pending_close.take() {
+            drop(d);
+            unsafe { usb::cdc_acm_host_close(h.0) };
+            return Err(anyhow!("usb serial detached"));
         }
         Ok(())
     }
 
-    /// Applies the line settings a CP210x bridge needs.
-    fn configure_cp210x(&self, hdl: usb::cdc_acm_dev_hdl_t) -> Result<()> {
-        let iface = self.inner.interface as u16;
-        let send = |req: u8, value: u16, data: &mut [u8]| unsafe {
+    /// Sends the stored line settings and modem lines to the interface,
+    /// only the parts that differ from what was last sent.
+    fn apply(&self, hdl: usb::cdc_acm_dev_hdl_t, driver: Driver) -> Result<()> {
+        let line = *self.inner.line.lock().unwrap();
+        let modem = *self.inner.modem.lock().unwrap();
+        let applied = *self.inner.applied.lock().unwrap();
+        let old_line = applied.map(|(l, _)| l);
+        let old_modem = applied.map(|(_, m)| m);
+        let line_changed = old_line != Some(line);
+        let modem_changed = old_modem.map(|m| (m.dtr, m.rts)) != Some((modem.dtr, modem.rts));
+        let break_changed = old_modem.map(|m| m.brk).unwrap_or(false) != modem.brk;
+        let result = match driver {
+            Driver::Cdc => {
+                self.apply_cdc(hdl, line, modem, line_changed, modem_changed, break_changed)
+            }
+            Driver::Ftdi { chip, .. } => self.apply_ftdi(
+                hdl,
+                chip,
+                line,
+                modem,
+                line_changed,
+                modem_changed || break_changed,
+            ),
+            Driver::Cp210x => {
+                self.apply_cp210x(hdl, line, modem, line_changed, modem_changed, break_changed)
+            }
+            Driver::Ch34x => self.apply_ch34x(hdl, line, modem, line_changed, modem_changed),
+        };
+        *self.inner.applied.lock().unwrap() = Some((line, modem));
+        result
+    }
+
+    /// Does what a chip needs once, when its interface is opened.
+    fn configure(&self, hdl: usb::cdc_acm_dev_hdl_t, driver: Driver) -> Result<()> {
+        match driver {
+            Driver::Cdc => Ok(()),
+            Driver::Ftdi { chip, .. } => {
+                let port = chip.port_index(self.inner.interface);
+                let requests: [(u8, u16, u16); 3] = [
+                    (FTDI_SIO_RESET, 0, port),         // reset the port
+                    (FTDI_SIO_SET_FLOW_CTRL, 0, port), // no flow control
+                    (FTDI_SIO_SET_LATENCY_TIMER, FTDI_LATENCY_MS, port),
+                ];
+                for (req, value, index) in requests {
+                    self.ftdi_request(hdl, req, value, index);
+                }
+                Ok(())
+            }
+            Driver::Cp210x => {
+                if self.cp210x_request(hdl, CP210X_IFC_ENABLE, 0x0001, &mut []) != sys::ESP_OK {
+                    warn!("usb: CP210x IFC_ENABLE failed");
+                }
+                Ok(())
+            }
+            Driver::Ch34x => {
+                // The version is only reported; every CH340/CH341 takes the same setup.
+                let mut version = [0u8; 2];
+                let rc = unsafe {
+                    usb::cdc_acm_host_send_custom_request(
+                        hdl,
+                        CH34X_REQ_TYPE_IN,
+                        CH34X_REQ_READ_VERSION,
+                        0,
+                        0,
+                        2,
+                        version.as_mut_ptr(),
+                    )
+                };
+                let version = if rc == sys::ESP_OK { version[0] } else { 0 };
+                debug!("usb: CH34x version {version:#04x}");
+                if self.ch34x_request(hdl, CH34X_REQ_SERIAL_INIT, 0, 0) != sys::ESP_OK {
+                    warn!("usb: CH34x SERIAL_INIT failed");
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn apply_cdc(
+        &self,
+        hdl: usb::cdc_acm_dev_hdl_t,
+        line: LineSettings,
+        modem: Modem,
+        line_changed: bool,
+        modem_changed: bool,
+        break_changed: bool,
+    ) -> Result<()> {
+        unsafe {
+            if line_changed {
+                let coding = usb::cdc_acm_line_coding_t {
+                    dwDTERate: line.baud,
+                    bCharFormat: line.stop_bits.cdc(),
+                    bParityType: line.parity.cdc(),
+                    bDataBits: line.data_bits,
+                };
+                if usb::cdc_acm_host_line_coding_set(hdl, &coding) != sys::ESP_OK {
+                    debug!("usb: device ignores line coding (fine for native CDC consoles)");
+                }
+            }
+            if modem_changed {
+                let _ = usb::cdc_acm_host_set_control_line_state(hdl, modem.dtr, modem.rts);
+            }
+            if break_changed {
+                let value = if modem.brk { CDC_BREAK_HOLD } else { 0 };
+                let rc = usb::cdc_acm_host_send_custom_request(
+                    hdl,
+                    CDC_REQ_TYPE_OUT,
+                    CDC_SEND_BREAK,
+                    value,
+                    self.inner.interface as u16,
+                    0,
+                    core::ptr::null_mut(),
+                );
+                if rc != sys::ESP_OK {
+                    return Err(anyhow!("device refused SEND_BREAK ({rc})"));
+                }
+            }
+        }
+        debug!(
+            "usb: CDC interface {} set to {line} {modem:?}",
+            self.inner.interface
+        );
+        Ok(())
+    }
+
+    fn cp210x_request(
+        &self,
+        hdl: usb::cdc_acm_dev_hdl_t,
+        req: u8,
+        value: u16,
+        data: &mut [u8],
+    ) -> sys::esp_err_t {
+        unsafe {
             usb::cdc_acm_host_send_custom_request(
                 hdl,
                 CP210X_REQ_TYPE_OUT,
                 req,
                 value,
-                iface,
+                self.inner.interface as u16,
                 data.len() as u16,
                 if data.is_empty() {
                     core::ptr::null_mut()
@@ -749,29 +1080,53 @@ impl UsbSerial {
                     data.as_mut_ptr()
                 },
             )
-        };
-        if send(CP210X_IFC_ENABLE, 0x0001, &mut []) != sys::ESP_OK {
-            warn!("usb: CP210x IFC_ENABLE failed");
         }
-        // The baud rate travels in the data stage as a little-endian u32.
-        let mut baud = self.inner.baud.to_le_bytes();
-        if send(CP210X_SET_BAUDRATE, 0, &mut baud) != sys::ESP_OK {
-            warn!("usb: CP210x SET_BAUDRATE failed");
+    }
+
+    fn apply_cp210x(
+        &self,
+        hdl: usb::cdc_acm_dev_hdl_t,
+        line: LineSettings,
+        modem: Modem,
+        line_changed: bool,
+        modem_changed: bool,
+        break_changed: bool,
+    ) -> Result<()> {
+        if line_changed {
+            // The baud rate travels in the data stage as a little-endian u32.
+            let mut baud = line.baud.to_le_bytes();
+            if self.cp210x_request(hdl, CP210X_SET_BAUDRATE, 0, &mut baud) != sys::ESP_OK {
+                warn!("usb: CP210x SET_BAUDRATE failed");
+            }
+            if self.cp210x_request(hdl, CP210X_SET_LINE_CTL, cp210x_line_ctl(&line), &mut [])
+                != sys::ESP_OK
+            {
+                return Err(anyhow!("CP210x refused {line}"));
+            }
         }
-        // 8 data bits, no parity, 1 stop bit.
-        let _ = send(CP210X_SET_LINE_CTL, 0x0800, &mut []);
-        // Assert DTR and RTS (low byte = values, high byte = write mask).
-        let _ = send(CP210X_SET_MHS, 0x0303, &mut []);
+        if modem_changed {
+            // Low byte = values, high byte = write mask.
+            let value = 0x0300 | modem.dtr as u16 | (modem.rts as u16) << 1;
+            let _ = self.cp210x_request(hdl, CP210X_SET_MHS, value, &mut []);
+        }
+        if break_changed {
+            let _ = self.cp210x_request(hdl, CP210X_SET_BREAK, modem.brk as u16, &mut []);
+        }
         debug!(
-            "usb: CP210x interface {iface} configured for {} baud",
-            self.inner.baud
+            "usb: CP210x interface {} set to {line} {modem:?}",
+            self.inner.interface
         );
         Ok(())
     }
 
-    /// Applies the line settings a CH340/CH341 bridge needs.
-    fn configure_ch34x(&self, hdl: usb::cdc_acm_dev_hdl_t) -> Result<()> {
-        let out = |req: u8, value: u16, index: u16| unsafe {
+    fn ch34x_request(
+        &self,
+        hdl: usb::cdc_acm_dev_hdl_t,
+        req: u8,
+        value: u16,
+        index: u16,
+    ) -> sys::esp_err_t {
+        unsafe {
             usb::cdc_acm_host_send_custom_request(
                 hdl,
                 CH34X_REQ_TYPE_OUT,
@@ -781,87 +1136,103 @@ impl UsbSerial {
                 0,
                 core::ptr::null_mut(),
             )
-        };
-        // The version is only reported; every CH340/CH341 takes the same setup.
-        let mut version = [0u8; 2];
-        let rc = unsafe {
-            usb::cdc_acm_host_send_custom_request(
-                hdl,
-                CH34X_REQ_TYPE_IN,
-                CH34X_REQ_READ_VERSION,
-                0,
-                0,
-                2,
-                version.as_mut_ptr(),
-            )
-        };
-        let version = if rc == sys::ESP_OK { version[0] } else { 0 };
+        }
+    }
 
-        if out(CH34X_REQ_SERIAL_INIT, 0, 0) != sys::ESP_OK {
-            warn!("usb: CH34x SERIAL_INIT failed");
+    fn apply_ch34x(
+        &self,
+        hdl: usb::cdc_acm_dev_hdl_t,
+        line: LineSettings,
+        modem: Modem,
+        line_changed: bool,
+        modem_changed: bool,
+    ) -> Result<()> {
+        if line_changed {
+            let regs = ch34x_baud_registers(line.baud);
+            if self.ch34x_request(
+                hdl,
+                CH34X_REQ_WRITE_REG,
+                (CH34X_REG_DIVISOR << 8) | CH34X_REG_PRESCALER,
+                regs,
+            ) != sys::ESP_OK
+            {
+                warn!("usb: CH34x baud rate write failed");
+            }
+            let lcr = ch34x_lcr(&line).ok_or_else(|| anyhow!("CH34x cannot do {line}"))?;
+            let _ = self.ch34x_request(
+                hdl,
+                CH34X_REQ_WRITE_REG,
+                (CH34X_REG_LCR2 << 8) | CH34X_REG_LCR,
+                lcr,
+            );
+            debug!("usb: CH34x set to {line} (registers {regs:#06x}, lcr {lcr:#04x})");
         }
-        let regs = ch34x_baud_registers(self.inner.baud);
-        if out(
-            CH34X_REQ_WRITE_REG,
-            (CH34X_REG_DIVISOR << 8) | CH34X_REG_PRESCALER,
-            regs,
-        ) != sys::ESP_OK
-        {
-            warn!("usb: CH34x baud rate write failed");
+        if modem_changed {
+            // The modem-control request takes the complement of the wanted bits.
+            let dtr = if modem.dtr { CH34X_MCR_DTR } else { 0 };
+            let rts = if modem.rts { CH34X_MCR_RTS } else { 0 };
+            let _ = self.ch34x_request(hdl, CH34X_REQ_MODEM_CTRL, !(dtr | rts), 0);
         }
-        let _ = out(
-            CH34X_REQ_WRITE_REG,
-            (CH34X_REG_LCR2 << 8) | CH34X_REG_LCR,
-            CH34X_LCR_8N1,
-        );
-        // The modem-control request takes the complement of the wanted bits.
-        let _ = out(CH34X_REQ_MODEM_CTRL, !CH34X_MCR_DTR_RTS, 0);
-        debug!(
-            "usb: CH34x (version {version:#04x}) configured for {} baud (registers {regs:#06x})",
-            self.inner.baud
-        );
         Ok(())
     }
 
-    /// Applies the line settings an FTDI bridge needs (it ignores CDC requests).
-    fn configure_ftdi(&self, hdl: usb::cdc_acm_dev_hdl_t, chip: FtdiChip) -> Result<()> {
-        let port = chip.port_index(self.inner.interface);
-        let baud = ftdi_baud_request(self.inner.baud, chip, self.inner.interface);
-        let requests: [(u8, u16, u16); 6] = [
-            (FTDI_SIO_RESET, 0, port),         // reset the port
-            (FTDI_SIO_SET_FLOW_CTRL, 0, port), // no flow control
-            (FTDI_SIO_SET_BAUDRATE, baud.value, baud.index),
-            (FTDI_SIO_SET_DATA, 0x0008, port), // 8 data bits, no parity, 1 stop
-            (FTDI_SIO_SET_LATENCY_TIMER, FTDI_LATENCY_MS, port),
-            (FTDI_SIO_SET_MODEM_CTRL, 0x0303, port), // DTR and RTS asserted
-        ];
-        for (req, value, index) in requests {
-            let rc = unsafe {
-                usb::cdc_acm_host_send_custom_request(
-                    hdl,
-                    FTDI_REQ_TYPE_OUT,
-                    req,
-                    value,
-                    index,
-                    0,
-                    core::ptr::null_mut(),
-                )
-            };
-            if rc != sys::ESP_OK {
-                warn!("usb: FTDI request {req:#04x} failed ({rc})");
-            }
+    fn ftdi_request(&self, hdl: usb::cdc_acm_dev_hdl_t, req: u8, value: u16, index: u16) {
+        let rc = unsafe {
+            usb::cdc_acm_host_send_custom_request(
+                hdl,
+                FTDI_REQ_TYPE_OUT,
+                req,
+                value,
+                index,
+                0,
+                core::ptr::null_mut(),
+            )
+        };
+        if rc != sys::ESP_OK {
+            warn!("usb: FTDI request {req:#04x} failed ({rc})");
         }
-        debug!(
-            "usb: FTDI port {port} ({}) configured for {} baud (wValue {:#06x} wIndex {:#06x})",
-            if chip.fast_clock {
-                "12 MHz clock"
-            } else {
-                "3 MHz clock"
-            },
-            self.inner.baud,
-            baud.value,
-            baud.index
-        );
+    }
+
+    /// Applies the line settings to an FTDI bridge (it ignores CDC requests).
+    /// The break condition is a bit of the framing request, so a change of
+    /// either resends it.
+    fn apply_ftdi(
+        &self,
+        hdl: usb::cdc_acm_dev_hdl_t,
+        chip: FtdiChip,
+        line: LineSettings,
+        modem: Modem,
+        line_changed: bool,
+        modem_changed: bool,
+    ) -> Result<()> {
+        let port = chip.port_index(self.inner.interface);
+        if line_changed {
+            let baud = ftdi_baud_request(line.baud, chip, self.inner.interface);
+            self.ftdi_request(hdl, FTDI_SIO_SET_BAUDRATE, baud.value, baud.index);
+            debug!(
+                "usb: FTDI port {port} ({}) set to {line} (wValue {:#06x} wIndex {:#06x})",
+                if chip.fast_clock {
+                    "12 MHz clock"
+                } else {
+                    "3 MHz clock"
+                },
+                baud.value,
+                baud.index
+            );
+        }
+        if line_changed || modem_changed {
+            self.ftdi_request(
+                hdl,
+                FTDI_SIO_SET_DATA,
+                ftdi_data_value(&line, modem.brk),
+                port,
+            );
+        }
+        if modem_changed {
+            // Bits 8 and 9 say the DTR and RTS values are being written.
+            let value = 0x0300 | modem.dtr as u16 | (modem.rts as u16) << 1;
+            self.ftdi_request(hdl, FTDI_SIO_SET_MODEM_CTRL, value, port);
+        }
         Ok(())
     }
 
@@ -910,14 +1281,10 @@ impl UsbSerial {
                 break;
             }
         }
-        let mut d = self.inner.dev.lock().unwrap();
-        d.in_use = false;
-        if let Some(h) = d.pending_close.take() {
-            // The device left while we were sending; finish the close now.
-            drop(d);
-            unsafe { usb::cdc_acm_host_close(h.0) };
-            return Err(anyhow!("usb serial detached"));
-        }
+        // The device may have left while we were sending.
+        self.release()?;
+        // A setting that changed while we were sending.
+        self.flush();
         result
     }
 }

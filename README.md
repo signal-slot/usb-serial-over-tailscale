@@ -28,6 +28,7 @@ Not verified:
 - CP210x, CH340/CH341, and non-H-series FTDI chips such as the FT232R.
 - Recovery after a reboot of the target SBC, an internet outage, or an unreachable control server.
 - Long-running operation, behaviour after node key expiry (180 days by default), and reboots triggered by the task watchdog.
+- RFC 2217 sessions on the hardware (pyserial and esptool against the Telnet state machine are tested on the host with `cargo run -p adapter-core --example rfc2217_sim`).
 
 ### Module variants
 
@@ -163,24 +164,32 @@ Which interfaces those are is read from the device when it is plugged in, so not
 | Toradex Dahlia, MCU console (FT4232H port C) | 2 | 35932 |
 | Toradex Dahlia, Verdin console (FT4232H port D) | 3 | 35933 |
 
-From any machine on the tailnet, open a raw TCP connection to that port of the hostname or tailnet address.
+From any machine on the tailnet, open a raw TCP connection to that port of the hostname or tailnet address, or an RFC 2217 (Telnet) one.
 
 ```bash
 socat -,rawer,escape=0x1d TCP:target-console:35933   # Ctrl-] to exit
 nc target-console 35933
+python -m serial.tools.miniterm rfc2217://target-console:35933 9600   # RFC 2217: the client sets the line
+esptool --port rfc2217://target-console:35930 flash_id                 # DTR and RTS reset an ESP32 target
 ```
 
 One connection at a time is served per port.
 A second connection while one is active receives `busy` and is closed.
 A peer that stops responding is dropped after 120 seconds and the next connection is accepted.
-Bytes flow unchanged in both directions; there is no protocol on top.
-The baud rate is set on the adapter and cannot be changed by the client.
 
-The ports are independent: each has its own USB interface and its own busy state, and a client on one port does not block another.
-They share one USB device, one baud rate and one tailnet address.
-The USB interface is claimed only while a client is connected to its port.
-The ESP32-S3's host controller has eight pipes, one for control and two per open interface (three for CDC-ACM), so at most three ports of an FT4232H can be in use at the same time; a fourth connection is told `usb: cannot open the interface` and closed.
-`status` on the shell lists the interfaces with their ports and marks the open ones.
+The first byte the client sends decides what the session is.
+A client that opens with Telnet negotiation (IAC, 0xFF), as pyserial's `rfc2217://` and esptool do, gets an RFC 2217 session: it can set the baud rate, data bits, parity and stop bits, drive DTR and RTS, hold a break and purge the receive buffer, and every setting is answered with the value in force, so a refused one is visible to the client.
+The settings last until the client disconnects; the next session starts again from the adapter's `baud` and 8N1 with DTR and RTS asserted.
+Flow control is reported as none, and modem-state and line-state notifications are not sent.
+Anything else is a raw session: bytes flow unchanged in both directions, there is no protocol on top, and the baud rate is the adapter's setting.
+A `telnet` client that negotiates first (netkit, inetutils) gets an RFC 2217 session in character mode; the BSD one waits for the server to speak first and so gets a raw session in line mode.
+Bytes the target sends before the client's first byte go out unframed in either case.
+
+The ports are independent: each has its own USB interface, its own busy state and its own line settings, and a client on one port does not block another.
+They share one USB device and one tailnet address.
+The USB interface is claimed when the first client connects to its port and stays claimed after the client leaves; output from the target is dropped while nobody is connected.
+The ESP32-S3's host controller has eight pipes, one for control and two per open interface (three for CDC-ACM), so at most three ports of an FT4232H can be claimed at the same time. A client on a fourth port takes the pipes of an idle port; if every claimed port has a client, the connection is told `usb: cannot open the interface` and closed.
+`status` on the shell lists the interfaces with their ports, marks the open ones with their line settings and the idle claimed ones with `claimed`.
 
 ### Power and wiring
 
@@ -244,6 +253,7 @@ The cargo runner pins the board's UART port to `/dev/ttyACM0`; adjust `.cargo/co
 - WireGuard timestamps are corrected with the offset between the system clock and control time, and with SNTP.
 - Network thread stacks live in PSRAM; only the control thread, which writes flash, keeps an internal-RAM stack.
 - The USB host relies on the CDC-ACM host driver's fallback of opening any interface with two bulk endpoints; FTDI, CP210x and CH34x get only their chip-specific setup through vendor control transfers.
+- The interface stays claimed between sessions because of the USB data toggle. A pipe the host creates starts at DATA0, while the device keeps the toggle of each endpoint from the session before. Claiming the interface per session made the device acknowledge and drop the first packet of every other session, with no error on the host: the first keystroke vanished. Asking the device to reset its toggles with CLEAR_FEATURE(ENDPOINT_HALT) was tried and does not work on the Debug Probe (TinyUSB), so the pipes are kept instead.
 
 ## Out of scope
 

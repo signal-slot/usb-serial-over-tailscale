@@ -1,10 +1,175 @@
-//! Baud-rate encodings for USB-serial bridge chips that ignore the CDC-ACM
-//! line-coding request. Pure functions, unit-tested on the host.
+//! Line settings of the serial port and their encodings for USB-serial
+//! bridge chips that ignore the CDC-ACM line-coding request. Pure functions,
+//! unit-tested on the host.
 //!
-//! Written from FTDI's application note AN232B-05, Espressif's esp-usb VCP
-//! drivers (Apache-2.0) and FreeBSD's `uftdi` and `uchcom` drivers
-//! (BSD-2-Clause). The expected values in the tests were produced with those
-//! implementations.
+//! Written from FTDI's application note AN232B-05, Silicon Labs' AN571,
+//! Espressif's esp-usb VCP drivers (Apache-2.0) and FreeBSD's `uftdi` and
+//! `uchcom` drivers (BSD-2-Clause). The expected values in the tests were
+//! produced with those implementations.
+
+/// Parity of the serial line, numbered as RFC 2217's SET-PARITY does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Parity {
+    None = 1,
+    Odd = 2,
+    Even = 3,
+    Mark = 4,
+    Space = 5,
+}
+
+impl Parity {
+    /// The RFC 2217 code; `None` for 0 (a query) and unknown codes.
+    pub fn from_rfc2217(code: u8) -> Option<Parity> {
+        Some(match code {
+            1 => Parity::None,
+            2 => Parity::Odd,
+            3 => Parity::Even,
+            4 => Parity::Mark,
+            5 => Parity::Space,
+            _ => return None,
+        })
+    }
+
+    pub fn rfc2217(self) -> u8 {
+        self as u8
+    }
+
+    /// `bParityType` of the CDC line coding (0 none, 1 odd, 2 even, 3 mark,
+    /// 4 space), which FTDI's SET_DATA and the CP210x SET_LINE_CTL share.
+    pub fn cdc(self) -> u8 {
+        self as u8 - 1
+    }
+
+    fn letter(self) -> char {
+        match self {
+            Parity::None => 'N',
+            Parity::Odd => 'O',
+            Parity::Even => 'E',
+            Parity::Mark => 'M',
+            Parity::Space => 'S',
+        }
+    }
+}
+
+/// Stop bits of the serial line, numbered as RFC 2217's SET-STOPSIZE does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopBits {
+    One = 1,
+    Two = 2,
+    OneAndHalf = 3,
+}
+
+impl StopBits {
+    /// The RFC 2217 code; `None` for 0 (a query) and unknown codes.
+    pub fn from_rfc2217(code: u8) -> Option<StopBits> {
+        Some(match code {
+            1 => StopBits::One,
+            2 => StopBits::Two,
+            3 => StopBits::OneAndHalf,
+            _ => return None,
+        })
+    }
+
+    pub fn rfc2217(self) -> u8 {
+        self as u8
+    }
+
+    /// `bCharFormat` of the CDC line coding (0 one, 1 one and a half, 2
+    /// two), which FTDI's SET_DATA and the CP210x SET_LINE_CTL share.
+    pub fn cdc(self) -> u8 {
+        match self {
+            StopBits::One => 0,
+            StopBits::OneAndHalf => 1,
+            StopBits::Two => 2,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            StopBits::One => "1",
+            StopBits::OneAndHalf => "1.5",
+            StopBits::Two => "2",
+        }
+    }
+}
+
+/// Baud rate and framing of the serial line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineSettings {
+    pub baud: u32,
+    /// 5 to 8.
+    pub data_bits: u8,
+    pub parity: Parity,
+    pub stop_bits: StopBits,
+}
+
+impl LineSettings {
+    /// `baud` with the usual 8N1 framing.
+    pub fn new(baud: u32) -> LineSettings {
+        LineSettings {
+            baud,
+            data_bits: 8,
+            parity: Parity::None,
+            stop_bits: StopBits::One,
+        }
+    }
+}
+
+impl std::fmt::Display for LineSettings {
+    /// `115200 8N1`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {}{}{}",
+            self.baud,
+            self.data_bits,
+            self.parity.letter(),
+            self.stop_bits.label()
+        )
+    }
+}
+
+/// wValue of an FTDI SET_DATA (0x04) request: the data bits in the low
+/// byte, the parity in bits 8 to 10, the stop bits in bits 11 to 12 and
+/// the break condition in bit 14.
+pub fn ftdi_data_value(line: &LineSettings, break_on: bool) -> u16 {
+    let break_bit = if break_on { 1 << 14 } else { 0 };
+    line.data_bits as u16
+        | (line.parity.cdc() as u16) << 8
+        | (line.stop_bits.cdc() as u16) << 11
+        | break_bit
+}
+
+/// wValue of a CP210x SET_LINE_CTL (0x03) request: the stop bits in bits
+/// 0 to 3, the parity in bits 4 to 7 and the data bits in the high byte.
+pub fn cp210x_line_ctl(line: &LineSettings) -> u16 {
+    (line.data_bits as u16) << 8 | (line.parity.cdc() as u16) << 4 | line.stop_bits.cdc() as u16
+}
+
+/// Line control register (0x18) of a CH340/CH341 with the receiver and
+/// transmitter enabled. `None` for one and a half stop bits, which the
+/// chip has no setting for.
+pub fn ch34x_lcr(line: &LineSettings) -> Option<u16> {
+    const ENABLE_RX: u16 = 0x80;
+    const ENABLE_TX: u16 = 0x40;
+    const MARK_SPACE: u16 = 0x20;
+    const PARITY_EVEN: u16 = 0x10;
+    const PARITY_ENABLE: u16 = 0x08;
+    const STOP_BITS_2: u16 = 0x04;
+    let parity = match line.parity {
+        Parity::None => 0,
+        Parity::Odd => PARITY_ENABLE,
+        Parity::Even => PARITY_ENABLE | PARITY_EVEN,
+        Parity::Mark => PARITY_ENABLE | MARK_SPACE,
+        Parity::Space => PARITY_ENABLE | PARITY_EVEN | MARK_SPACE,
+    };
+    let stop = match line.stop_bits {
+        StopBits::One => 0,
+        StopBits::Two => STOP_BITS_2,
+        StopBits::OneAndHalf => return None,
+    };
+    Some(ENABLE_RX | ENABLE_TX | parity | stop | (line.data_bits.clamp(5, 8) - 5) as u16)
+}
 
 /// What the FTDI baud-rate generator of a given chip can do, derived from
 /// `bcdDevice` in the USB device descriptor.
@@ -265,6 +430,36 @@ mod tests {
         for (baud, regs) in table {
             assert_eq!((baud, ch34x_baud_registers(baud)), (baud, regs));
         }
+    }
+
+    #[test]
+    fn framing_encodings_match_reference_drivers() {
+        // (data bits, parity, stop bits) -> FTDI SET_DATA, CP210x LINE_CTL, CH34x LCR,
+        // from Linux ftdi_sio, cp210x and ch341.
+        let table: [(u8, Parity, StopBits, u16, u16, Option<u16>); 5] = [
+            (8, Parity::None, StopBits::One, 0x0008, 0x0800, Some(0xc3)),
+            (7, Parity::Even, StopBits::One, 0x0207, 0x0720, Some(0xda)),
+            (8, Parity::Odd, StopBits::Two, 0x1108, 0x0812, Some(0xcf)),
+            (8, Parity::Mark, StopBits::One, 0x0308, 0x0830, Some(0xeb)),
+            (5, Parity::Space, StopBits::OneAndHalf, 0x0c05, 0x0541, None),
+        ];
+        for (bits, parity, stop, ftdi, cp210x, ch34x) in table {
+            let line = LineSettings {
+                baud: 115200,
+                data_bits: bits,
+                parity,
+                stop_bits: stop,
+            };
+            assert_eq!(ftdi_data_value(&line, false), ftdi, "{line}");
+            assert_eq!(cp210x_line_ctl(&line), cp210x, "{line}");
+            assert_eq!(ch34x_lcr(&line), ch34x, "{line}");
+        }
+        assert_eq!(ftdi_data_value(&LineSettings::new(9600), true), 0x4008);
+        assert_eq!(LineSettings::new(9600).to_string(), "9600 8N1");
+        assert_eq!(Parity::from_rfc2217(0), None);
+        assert_eq!(Parity::from_rfc2217(3), Some(Parity::Even));
+        assert_eq!(StopBits::from_rfc2217(3), Some(StopBits::OneAndHalf));
+        assert_eq!(StopBits::OneAndHalf.rfc2217(), 3);
     }
 
     #[test]
