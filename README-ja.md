@@ -87,16 +87,18 @@ PSRAM 付きで USB-C が 2 つ（COM と native USB）ある ESP32-S3 ボード
 
 <img src="web/usb-otg-pad.webp" alt="裏面の USB-OTG パッド（短絡前）" width="360">
 これは必須で、ボードから対象の USB ポートへ 5 V を送るためのものである。短絡しないと対象のチップに電源が入らず、検出されない。
-2 つのポートの役割は固定である。**`COM` = 5 V の給電**（充電器か PC）、**`USB` = SBC**（対象のデバッグ用 USB ポート）。書き込みと設定のときだけ、`USB` を PC につなぐ。
+2 つのポートの役割は固定である。**`COM` = 5 V の給電**（充電器か PC）、**`USB` = SBC**（対象のデバッグ用 USB ポート）。書き込みと設定は `COM` を PC につないで行う（給電も兼ねる）。`USB` は SBC につないだままでよい。
 短絡に伴う注意は後述の「給電と配線」にある。
 
 ### ブラウザから書き込む
 
 Chrome か Edge で [signal-slot.github.io/usb-serial-over-tailscale](https://signal-slot.github.io/usb-serial-over-tailscale/) を開くと、ソフトウェアを何も入れずに書き込みと初期設定ができる。
-ページは WebSerial でボードの USB Serial/JTAG ポートを開き、ESP Web Tools（esptool-js）で CI がビルドしたバイナリを書く。
+ページは WebSerial でボードの COM ポート（CH343、1a86:55d3）か USB Serial/JTAG ポート（303a:1001）を開き、ESP Web Tools（esptool-js）で CI がビルドしたバイナリを書く。
 同じページの端末でセットアップウィザードも操作できる。
 Windows 10 以降、macOS、Linux、ChromeOS で動き、Firefox と Safari とスマートフォンでは動かない。
-つなぐのは native 側の USB で、COM 側（CH343）は Windows でドライバが要るので使わない。
+つなぐのは COM 側である。自動ダウンロード回路で書き込め、起動ログも見え、対象は native 側につないだままでよい。
+native 側でも書き込めて、端末を開くとすぐウィザードが始まるが、セットアップが終わるとポートは USB ホストになって見えなくなる。
+OS に COM ポートが見えないときは native 側を使う。
 
 ページではモジュールの金属カバーの刻印（`ESP32-S3-WROOM-1-N16R8` など）から型番を選ぶ。
 CI（GitHub Actions）は push のたびに全型番をビルドし、`v*` タグでは Release にも `usb-serial-over-tailscale-<型番>.bin`（bootloader、パーティション表、アプリを結合した 1 本）を添付する。
@@ -107,6 +109,7 @@ CI（GitHub Actions）は push のたびに全型番をビルドし、`v*` タ�
 
 未設定の状態で native USB ポートを PC に挿すと、USB シリアル（Espressif USB JTAG/serial、303a:1001）として見える。
 ターミナルで開いて Enter を押すと、ウィザードが始まる。
+COM 側にも同じシェルが 115200 でログと一緒に出ている。Enter を押すまで無言で、`setup` と打つとウィザードが始まる。
 
 ```bash
 screen /dev/ttyACM0 115200
@@ -203,7 +206,8 @@ native 側は USB ホストとして対象につなぐポートで、対象の�
 native 側から 5 V を出すには、裏面の `USB-OTG` パッドを短絡する。
 このパッドは USB-C を 2 つ持つ DevKitC-1 互換ボードの多くにある。ないボードでは、native 側の VBUS への給電を別の方法で確保する必要がある。
 これは 2 つの USB-C コネクタの VBUS を直結するので、短絡後は**両方を同時に PC へ挿さない**。
-セットアップは native 側だけを PC に、通常運用は COM 側を電源に、native 側を対象に、と使い分ける。
+書き込みとセットアップは COM 側を PC につなぐ。代わりに native 側を使うなら、そちらだけを PC につなぐ。
+通常運用は COM 側を電源に、native 側を対象につなぐ。
 対象が CDC-ACM か FTDI などのブリッジチップであれば、そのチップは通常バスパワーで動くので、この 5 V が必要である。
 
 ### 数秒ごとにリセットするボード

@@ -87,16 +87,18 @@ Short the `USB-OTG` solder pad on the back of the board (shown below before brid
 
 <img src="web/usb-otg-pad.webp" alt="USB-OTG solder pad on the back of the board, still open" width="360">
 This is required: it feeds 5 V from the board to the target's USB port, and without it the target chip never powers up and is never detected.
-The two ports have fixed roles: **`COM` = 5 V power in** (a charger or a PC), **`USB` = the SBC** (the target's debug USB port). Only for flashing and setup does `USB` go to the PC instead.
+The two ports have fixed roles: **`COM` = 5 V power in** (a charger or a PC), **`USB` = the SBC** (the target's debug USB port). For flashing and setup, `COM` goes to the PC (it powers the board as well); `USB` can stay on the SBC.
 See "Power and wiring" below for the safety rule that follows from it.
 
 ### Flash from a browser
 
 Open [signal-slot.github.io/usb-serial-over-tailscale](https://signal-slot.github.io/usb-serial-over-tailscale/) in Chrome or Edge to flash and configure the board without installing anything.
-The page opens the board's USB Serial/JTAG port with WebSerial and writes the CI-built binaries with ESP Web Tools (esptool-js).
+The page opens the board's COM port (CH343, 1a86:55d3) or its USB Serial/JTAG port (303a:1001) with WebSerial and writes the CI-built binaries with ESP Web Tools (esptool-js).
 A terminal on the same page runs the setup wizard.
 It works on Windows 10 and later, macOS, Linux and ChromeOS; it does not work in Firefox, Safari or on phones.
-Connect the native USB port. The COM port (CH343) needs a driver on Windows and is not used.
+Connect the COM port: it flashes through the board's auto-download circuit, carries the boot log, and the target can stay plugged into the native port.
+The native USB port works too and starts the wizard as soon as a terminal opens, but it disappears when setup completes and the port becomes the USB host.
+If the operating system does not list the COM port, use the native port instead.
 
 Pick the module variant on the page from the marking on the module's metal can (for example `ESP32-S3-WROOM-1-N16R8`).
 CI (GitHub Actions) builds every variant on each push. Tags matching `v*` also attach `usb-serial-over-tailscale-<variant>.bin` (bootloader, partition table and app merged into one file) to a release.
@@ -107,6 +109,7 @@ Updates from the page write only the three regions and keep the configuration.
 
 An unconfigured board plugged into a PC through the native USB port shows up as a USB serial port (Espressif USB JTAG/serial, 303a:1001).
 Open it in a terminal and press Enter to start the wizard.
+The COM port carries the same shell at 115200 together with the log output; it stays quiet until Enter, and `setup` starts the wizard there.
 
 ```bash
 screen /dev/ttyACM0 115200
@@ -200,7 +203,8 @@ The native port is the USB host port for the target; the target's debug port is 
 
 To supply 5 V from the native port, bridge the `USB-OTG` solder pad on the back of the board (present on many DevKitC-1-compatible boards with two USB-C ports; boards without it need their own way of feeding VBUS to the native port).
 This ties the VBUS of the two USB-C connectors together, so after bridging it **never plug both ports into PCs at the same time**.
-For setup, connect only the native port to the PC; in normal operation, connect the COM port to power and the native port to the target.
+For flashing and setup, connect the COM port to the PC; if you use the native port for that instead, connect only that one.
+In normal operation, connect the COM port to power and the native port to the target.
 If the target is a CDC-ACM or FTDI-style bridge chip, that chip is usually bus-powered and needs this 5 V.
 
 ### A board that resets every few seconds
