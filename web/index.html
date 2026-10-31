@@ -288,10 +288,18 @@ async function readLoop() {
 
 async function connect() {
   try {
-    port = await navigator.serial.requestPort({ filters: [{ usbVendorId: 0x303a }] });
+    // The shell runs on both the native USB Serial/JTAG port (Espressif,
+    // 303a) and UART0, which the CH343 on the COM port of these boards
+    // (1a86:55d3) exposes. The flashing dialog accepts either, so offer
+    // both here too; a board flashed over COM is set up over COM.
+    port = await navigator.serial.requestPort({ filters: [
+      { usbVendorId: 0x303a },
+      { usbVendorId: 0x1a86, usbProductId: 0x55d3 },
+    ] });
     await port.open({ baudRate: 115200 });
     // Both lines asserted is the "no reset" state of the USB Serial/JTAG
-    // auto-reset logic; anything else may drop the chip into download mode.
+    // auto-reset logic and of the DTR/RTS auto-download circuit behind
+    // the COM port; anything else may drop the chip into download mode.
     await port.setSignals({ dataTerminalReady: true, requestToSend: true });
     writer = port.writable.getWriter();
     closing = false;
